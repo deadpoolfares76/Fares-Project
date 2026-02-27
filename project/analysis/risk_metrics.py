@@ -1,288 +1,184 @@
-"""
-Risk Metrics Module
-Computes all risk/return metrics for a portfolio return series.
-"""
+"""Institutional risk metrics: Sharpe, Sortino, Calmar, Omega, IR, Tracking Error, VaR, CVaR..."""
 import numpy as np
 import pandas as pd
 from scipy import stats
 
-def _squeeze_series(s) -> pd.Series:
-    """Ensure s is a proper 1-D pandas Series."""
-    if isinstance(s, pd.DataFrame):
-        s = s.iloc[:, 0]
-    if hasattr(s, 'squeeze'):
-        s = s.squeeze()
-    return s
+def _sq(s):
+    if isinstance(s, pd.DataFrame): s = s.iloc[:,0]
+    return s.squeeze() if hasattr(s,"squeeze") else s
 
+def _align(*series):
+    df = pd.concat([_sq(s).rename(i) for i,s in enumerate(series)], axis=1).dropna()
+    return tuple(df[i] for i in range(len(series)))
 
+def ann_ret(r, p=252):
+    try: return float((1+float(_sq(r).dropna().mean()))**p-1)
+    except: return np.nan
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ANNUALISATION HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-TRADING_DAYS = 252
+def ann_vol(r, p=252):
+    try: return float(_sq(r).dropna().std()*np.sqrt(p))
+    except: return np.nan
 
+def compute_total_return(r):
+    r=_sq(r).dropna()
+    return float((1+r).prod()-1)*100 if len(r)>0 else np.nan
 
-def annualize_return(daily_ret: float) -> float:
-    return (1 + daily_ret) ** TRADING_DAYS - 1
+def compute_beta(rp, rm):
+    rp,rm=_align(rp,rm)
+    if len(rp)<10: return np.nan
+    cov=np.cov(rp.values.astype(float),rm.values.astype(float))
+    var=float(np.var(rm.values.astype(float),ddof=1))
+    return float(cov[0,1]/var) if var!=0 else np.nan
 
+def compute_alpha_capm(rp, rm, rf):
+    rp,rm,rf=_align(rp,rm,rf)
+    if len(rp)<10: return {}
+    ep=(rp-rf).values.astype(float); em=(rm-rf).values.astype(float)
+    sl,ic,rv,pv,se=stats.linregress(em,ep)
+    sl,ic,rv,pv,se=float(sl),float(ic),float(rv),float(pv),float(se)
+    t=ic/se if se!=0 else np.nan
+    return {"alpha":float((1+ic)**252-1),"alpha_pct":float((1+ic)**252-1)*100,
+            "beta":sl,"r_squared":rv**2,"t_stat":t,"p_value":pv}
 
-def annualize_vol(daily_vol: float) -> float:
-    return daily_vol * np.sqrt(TRADING_DAYS)
+def compute_sharpe(rp,rf):
+    rp,rf=_align(rp,rf); ex=(rp-rf).dropna()
+    if len(ex)<10: return np.nan
+    mu,sg=float(ex.mean()),float(ex.std())
+    return float(mu/sg*np.sqrt(252)) if sg!=0 else np.nan
 
+def compute_sortino(rp,rf):
+    rp,rf=_align(rp,rf); ex=(rp-rf).dropna()
+    if len(ex)<10: return np.nan
+    dn=ex[ex<0]
+    if len(dn)<2: return np.nan
+    dv=float(dn.std()*np.sqrt(252))
+    return float(ex.mean()*252/dv) if dv!=0 else np.nan
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BASIC RETURN & RISK MEASURES
-# ─────────────────────────────────────────────────────────────────────────────
-def compute_simple_returns(prices: pd.Series) -> pd.Series:
-    """R = (V_t - V_{t-1}) / V_{t-1}"""
-    return prices.pct_change().dropna()
+def compute_treynor(rp,rm,rf):
+    rp,rm,rf=_align(rp,rm,rf)
+    beta=compute_beta(rp,rm)
+    if np.isnan(beta) or beta==0: return np.nan
+    return float((float(rp.mean())-float(rf.mean()))*252/beta)
 
+def compute_calmar(rp):
+    r=_sq(rp).dropna()
+    if len(r)<10: return np.nan
+    a=ann_ret(r); dd=compute_max_drawdown(r)
+    return float(a/abs(dd/100)) if not np.isnan(dd) and dd!=0 else np.nan
 
-def compute_log_returns(prices: pd.Series) -> pd.Series:
-    """r = ln(V_t / V_{t-1})"""
-    return np.log(prices / prices.shift(1)).dropna()
+def compute_omega(rp, threshold=0.0):
+    r=_sq(rp).dropna().values.astype(float)
+    if len(r)<10: return np.nan
+    g=np.sum(np.maximum(r-threshold,0)); l=np.sum(np.maximum(threshold-r,0))
+    return float(g/l) if l!=0 else np.nan
 
+def compute_information_ratio(rp,rb):
+    rp,rb=_align(rp,rb); active=(rp-rb).dropna()
+    if len(active)<10: return np.nan
+    te=float(active.std()*np.sqrt(252))
+    return float(active.mean()*252/te) if te!=0 else np.nan
 
-def compute_volatility(returns: pd.Series, annualize: bool = True) -> float:
-    """σ = sqrt(Var(R))"""
-    vol = returns.std()
-    return annualize_vol(vol) if annualize else vol
+def compute_tracking_error(rp,rb):
+    rp,rb=_align(rp,rb); active=(rp-rb).dropna()
+    return float(active.std()*np.sqrt(252))*100 if len(active)>=10 else np.nan
 
+def compute_drawdown_series(rp):
+    r=_sq(rp).dropna(); w=(1+r).cumprod(); pk=w.cummax()
+    return (w-pk)/pk*100
 
-def compute_variance(returns: pd.Series) -> float:
-    """Var(R) = E[(R - μ)²]"""
-    return float(returns.var())
+def compute_max_drawdown(rp):
+    dd=compute_drawdown_series(rp)
+    return float(dd.min()) if len(dd)>0 else np.nan
 
+def compute_var_hist(rp, conf=0.95):
+    r=_sq(rp).dropna().values.astype(float)
+    return float(np.percentile(r,(1-conf)*100))*100 if len(r)>=10 else np.nan
 
-def compute_beta(portfolio_returns: pd.Series,
-                 market_returns: pd.Series) -> float:
-    """β = Cov(R_p, R_m) / Var(R_m)"""
-    aligned = pd.concat([portfolio_returns, market_returns], axis=1).dropna()
-    cov_matrix = aligned.cov()
-    var_market = aligned.iloc[:, 1].var()
-    if var_market == 0:
-        return np.nan
-    return cov_matrix.iloc[0, 1] / var_market
+def compute_var_param(rp, conf=0.95):
+    r=_sq(rp).dropna().values.astype(float)
+    if len(r)<10: return np.nan
+    return float(r.mean()+stats.norm.ppf(1-conf)*r.std())*100
 
+def compute_cvar(rp, conf=0.95):
+    r=_sq(rp).dropna().values.astype(float)
+    if len(r)<10: return np.nan
+    vp=np.percentile(r,(1-conf)*100); tail=r[r<=vp]
+    return float(tail.mean())*100 if len(tail)>0 else np.nan
 
-def compute_alpha_capm(portfolio_returns: pd.Series,
-                       market_returns: pd.Series,
-                       risk_free_rate: pd.Series) -> dict:
-    """
-    Estimate CAPM alpha and beta via OLS.
-    Returns dict with alpha, beta, t-stat, p-value, r-squared.
-    """
-    # Ensure all inputs are 1-D Series to avoid ambiguous array truth-value errors
-    p = portfolio_returns.squeeze() if hasattr(portfolio_returns, "squeeze") else portfolio_returns
-    m = market_returns.squeeze() if hasattr(market_returns, "squeeze") else market_returns
-    rf = risk_free_rate.squeeze() if hasattr(risk_free_rate, "squeeze") else risk_free_rate
-    if isinstance(rf, pd.DataFrame):
-        rf = rf.iloc[:, 0]
-    df = pd.concat([p.rename("Rp"), m.rename("Rm"), rf.rename("Rf")], axis=1).dropna()
-    excess_p = df["Rp"] - df["Rf"]
-    excess_m = df["Rm"] - df["Rf"]
-    slope, intercept, r_val, p_val, std_err = stats.linregress(
-        excess_m.values.astype(float), excess_p.values.astype(float)
-    )
-    # Cast everything to plain Python floats immediately
-    slope, intercept, r_val, p_val, std_err = (
-        float(slope), float(intercept), float(r_val), float(p_val), float(std_err)
-    )
-    alpha_annual = annualize_return(intercept)
-    t_stat = intercept / std_err if std_err != 0.0 else np.nan
+def compute_skewness(rp):
+    r=_sq(rp).dropna()
+    return float(r.skew()) if len(r)>3 else np.nan
+
+def compute_kurtosis(rp):
+    r=_sq(rp).dropna()
+    return float(r.kurtosis()) if len(r)>3 else np.nan
+
+def rolling_volatility(rp, window=63):
+    return _sq(rp).dropna().rolling(window).std()*np.sqrt(252)*100
+
+def rolling_beta(rp,rm,window=63):
+    rp2,rm2=_align(rp,rm)
+    combined=pd.concat([rp2.rename("p"),rm2.rename("m")],axis=1).dropna()
+    out=pd.Series(index=combined.index,dtype=float)
+    for i in range(window,len(combined)+1):
+        w=combined.iloc[i-window:i].values.astype(float)
+        vm=np.var(w[:,1],ddof=1)
+        out.iloc[i-1]=float(np.cov(w[:,0],w[:,1])[0,1]/vm) if vm!=0 else np.nan
+    return out
+
+def rolling_correlation(rp,rm,window=63):
+    rp2,rm2=_align(rp,rm)
+    return rp2.rolling(window).corr(rm2)
+
+def rolling_sharpe(rp,rf,window=252):
+    rp2,rf2=_align(rp,rf); ex=rp2-rf2
+    rm=ex.rolling(window).mean(); rs=ex.rolling(window).std()
+    return (rm/rs*np.sqrt(252)).replace([np.inf,-np.inf],np.nan)
+
+def detect_volatility_regimes(rp,window=21,threshold_pct=75.0):
+    r=_sq(rp).dropna(); rv=r.rolling(window).std()*np.sqrt(252)
+    return rv>=np.nanpercentile(rv.dropna(),threshold_pct)
+
+def regime_analysis(rp,rm,rf,mask,name="Portfolio"):
+    rp2,rm2,rf2=_align(rp,rm,rf)
+    msk=_sq(mask).reindex(rp2.index).ffill().bfill()
+    out={}
+    for label,cond in [("High Volatility",msk==True),("Low Volatility",msk==False)]:
+        idx=cond[cond].index
+        sr=rp2.loc[rp2.index.intersection(idx)]
+        smr=rm2.loc[rm2.index.intersection(idx)]
+        sfr=rf2.loc[rf2.index.intersection(idx)]
+        if len(sr)<20: continue
+        out[label]={"n_days":len(sr),"ann_return_pct":ann_ret(sr)*100,
+                    "ann_vol_pct":ann_vol(sr)*100,"sharpe":compute_sharpe(sr,sfr),
+                    "max_dd_pct":compute_max_drawdown(sr),"beta":compute_beta(sr,smr)}
+    return out
+
+def full_risk_summary(name,rp,rm,rf,benchmark=None,confidence=0.95):
+    r=_sq(rp).dropna(); m=_sq(rm).dropna(); f=_sq(rf).dropna()
+    capm=compute_alpha_capm(r,m,f)
     return {
-        "alpha": alpha_annual,
-        "alpha_daily": intercept,
-        "beta": slope,
-        "r_squared": r_val ** 2,
-        "t_stat_alpha": t_stat,
-        "p_value_alpha": p_val,
+        "Name":name,
+        "Ann. Return (%)":ann_ret(r)*100,
+        "Total Return (%)":compute_total_return(r),
+        "Ann. Volatility (%)":ann_vol(r)*100,
+        "Sharpe Ratio":compute_sharpe(r,f),
+        "Sortino Ratio":compute_sortino(r,f),
+        "Treynor Ratio":compute_treynor(r,m,f),
+        "Calmar Ratio":compute_calmar(r),
+        "Omega Ratio":compute_omega(r),
+        "Information Ratio":compute_information_ratio(r,benchmark) if benchmark is not None else np.nan,
+        "Tracking Error (%)":compute_tracking_error(r,benchmark) if benchmark is not None else np.nan,
+        "Beta":capm.get("beta",np.nan),
+        "CAPM Alpha (%)":capm.get("alpha_pct",np.nan),
+        "Alpha t-stat":capm.get("t_stat",np.nan),
+        "Alpha p-value":capm.get("p_value",np.nan),
+        "R-squared":capm.get("r_squared",np.nan),
+        "Max Drawdown (%)":compute_max_drawdown(r),
+        "VaR Hist (%)":compute_var_hist(r,confidence),
+        "VaR Param (%)":compute_var_param(r,confidence),
+        "CVaR (%)":compute_cvar(r,confidence),
+        "Skewness":compute_skewness(r),
+        "Excess Kurtosis":compute_kurtosis(r),
+        "n_obs":len(r),
     }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PERFORMANCE RATIOS
-# ─────────────────────────────────────────────────────────────────────────────
-def compute_sharpe(portfolio_returns: pd.Series,
-                   risk_free_rate: pd.Series) -> float:
-    """Sharpe = (R_p - R_f) / σ_p  (annualised)"""
-    portfolio_returns = _squeeze_series(portfolio_returns)
-    risk_free_rate = _squeeze_series(risk_free_rate)
-    df = pd.concat([portfolio_returns.rename("Rp"), risk_free_rate.rename("Rf")],
-                   axis=1).dropna()
-    excess = df["Rp"] - df["Rf"]
-    if excess.std() == 0:
-        return np.nan
-    return (excess.mean() / excess.std()) * np.sqrt(TRADING_DAYS)
-
-
-def compute_sortino(portfolio_returns: pd.Series,
-                    risk_free_rate: pd.Series) -> float:
-    """Sortino = (R_p - R_f) / σ_downside  (annualised)"""
-    portfolio_returns = _squeeze_series(portfolio_returns)
-    risk_free_rate = _squeeze_series(risk_free_rate)
-    df = pd.concat([portfolio_returns.rename("Rp"), risk_free_rate.rename("Rf")],
-                   axis=1).dropna()
-    excess = df["Rp"] - df["Rf"]
-    downside = excess[excess < 0]
-    if len(downside) == 0 or downside.std() == 0:
-        return np.nan
-    downside_vol = downside.std() * np.sqrt(TRADING_DAYS)
-    ann_excess = excess.mean() * TRADING_DAYS
-    return ann_excess / downside_vol
-
-
-def compute_treynor(portfolio_returns: pd.Series,
-                    market_returns: pd.Series,
-                    risk_free_rate: pd.Series) -> float:
-    """Treynor = (R_p - R_f) / β_p  (annualised)"""
-    portfolio_returns = _squeeze_series(portfolio_returns)
-    market_returns = _squeeze_series(market_returns)
-    risk_free_rate = _squeeze_series(risk_free_rate)
-    df = pd.concat([portfolio_returns.rename("Rp"), market_returns.rename("Rm"),
-                    risk_free_rate.rename("Rf")], axis=1).dropna()
-    excess_p = df["Rp"] - df["Rf"]
-    beta = compute_beta(df["Rp"], df["Rm"])
-    if beta == 0 or np.isnan(beta):
-        return np.nan
-    return (excess_p.mean() * TRADING_DAYS) / beta
-
-
-def compute_calmar(portfolio_returns: pd.Series) -> float:
-    """Calmar = Annualised Return / |Max Drawdown|"""
-    ann_ret = portfolio_returns.mean() * TRADING_DAYS
-    mdd = compute_max_drawdown(portfolio_returns)
-    if mdd == 0:
-        return np.nan
-    return ann_ret / abs(mdd)
-
-
-def compute_information_ratio(portfolio_returns: pd.Series,
-                               benchmark_returns: pd.Series) -> float:
-    """IR = Mean(Active Return) / Tracking Error"""
-    active = portfolio_returns - benchmark_returns
-    te = active.std() * np.sqrt(TRADING_DAYS)
-    if te == 0:
-        return np.nan
-    return (active.mean() * TRADING_DAYS) / te
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DRAWDOWN & EXTREME LOSS METRICS
-# ─────────────────────────────────────────────────────────────────────────────
-def compute_drawdown_series(returns: pd.Series) -> pd.Series:
-    """Returns the drawdown series (negative values)."""
-    wealth = (1 + returns).cumprod()
-    peak = wealth.cummax()
-    return (wealth - peak) / peak
-
-
-def compute_max_drawdown(returns: pd.Series) -> float:
-    """Maximum Drawdown (negative float)."""
-    dd = compute_drawdown_series(returns)
-    return float(dd.min())
-
-
-def compute_var(returns: pd.Series, confidence: float = 0.95,
-                method: str = "historical") -> float:
-    """
-    Value at Risk at given confidence level.
-    method: 'historical' or 'parametric'
-    Returns a negative number (loss).
-    """
-    if method == "historical":
-        return float(np.percentile(returns, (1 - confidence) * 100))
-    else:  # parametric / Gaussian
-        mu = returns.mean()
-        sigma = returns.std()
-        return float(stats.norm.ppf(1 - confidence, mu, sigma))
-
-
-def compute_cvar(returns: pd.Series, confidence: float = 0.95,
-                 method: str = "historical") -> float:
-    """
-    Conditional VaR / Expected Shortfall.
-    Returns the mean of losses beyond VaR (negative number).
-    """
-    var = compute_var(returns, confidence, method)
-    tail = returns[returns <= var]
-    if len(tail) == 0:
-        return var
-    return float(tail.mean())
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STATISTICAL MOMENTS
-# ─────────────────────────────────────────────────────────────────────────────
-def compute_skewness(returns: pd.Series) -> float:
-    """Skew = E[(R-μ)³] / σ³"""
-    return float(returns.skew())
-
-
-def compute_kurtosis(returns: pd.Series) -> float:
-    """Kurt = E[(R-μ)⁴] / σ⁴  (excess kurtosis, Normal = 0)"""
-    return float(returns.kurtosis())
-
-
-def compute_jarque_bera(returns: pd.Series) -> dict:
-    """Jarque-Bera normality test."""
-    jb_stat, jb_pval = stats.jarque_bera(returns.dropna())
-    return {"statistic": jb_stat, "p_value": jb_pval,
-            "normal": jb_pval > 0.05}
-
-
-def compute_hit_ratio(portfolio_returns: pd.Series,
-                      benchmark_returns: pd.Series) -> float:
-    """Percentage of periods where portfolio outperforms benchmark."""
-    aligned = pd.concat([portfolio_returns, benchmark_returns],
-                        axis=1).dropna()
-    outperform = (aligned.iloc[:, 0] > aligned.iloc[:, 1]).sum()
-    return outperform / len(aligned)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FULL SUMMARY TABLE
-# ─────────────────────────────────────────────────────────────────────────────
-def full_risk_summary(name: str,
-                      returns: pd.Series,
-                      market_returns: pd.Series,
-                      risk_free_rate: pd.Series,
-                      benchmark_returns: pd.Series = None,
-                      confidence: float = 0.95) -> dict:
-    """
-    Compute all risk/return metrics and return as a dict.
-    """
-    capm = compute_alpha_capm(returns, market_returns, risk_free_rate)
-
-    summary = {
-        "Name": name,
-        # ── Returns
-        "Ann. Return (%)": returns.mean() * TRADING_DAYS * 100,
-        "Total Return (%)": ((1 + returns).prod() - 1) * 100,
-        # ── Risk
-        "Ann. Volatility (%)": compute_volatility(returns) * 100,
-        "Variance (daily)": compute_variance(returns),
-        "Beta": capm["beta"],
-        "Max Drawdown (%)": compute_max_drawdown(returns) * 100,
-        # ── Ratios
-        "Sharpe Ratio": compute_sharpe(returns, risk_free_rate),
-        "Sortino Ratio": compute_sortino(returns, risk_free_rate),
-        "Treynor Ratio": compute_treynor(returns, market_returns, risk_free_rate),
-        "Calmar Ratio": compute_calmar(returns),
-        # ── CAPM
-        "CAPM Alpha (%)": capm["alpha"] * 100,
-        "CAPM R²": capm["r_squared"],
-        "Alpha t-stat": capm["t_stat_alpha"],
-        # ── Tail risk
-        f"VaR {confidence*100:.0f}% (%)": compute_var(returns, confidence) * 100,
-        f"CVaR {confidence*100:.0f}% (%)": compute_cvar(returns, confidence) * 100,
-        # ── Moments
-        "Skewness": compute_skewness(returns),
-        "Excess Kurtosis": compute_kurtosis(returns),
-    }
-
-    if benchmark_returns is not None:
-        summary["Info. Ratio"] = compute_information_ratio(returns, benchmark_returns)
-        summary["Hit Ratio (%)"] = compute_hit_ratio(returns, benchmark_returns) * 100
-
-    return summary

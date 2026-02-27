@@ -1,181 +1,121 @@
-"""
-Factor Models Module
-CAPM, Fama-French 3, 5, and 5+Momentum factor regressions.
+"""Factor models: CAPM, FF3, FF5, FF5+MOM — HAC-robust OLS
+Functions: run_capm, run_ff3, run_ff5, run_ff5_momentum, rolling_alpha, factor_decomposition
 """
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
-from statsmodels.regression.rolling import RollingOLS
 
 
-TRADING_DAYS = 252
+def _squeeze(s):
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    return s.squeeze() if hasattr(s, "squeeze") else s
 
 
-def _align_data(returns: pd.Series, factors: pd.DataFrame) -> pd.DataFrame:
-    """Align portfolio returns with factor data on common dates."""
-    df = pd.concat([returns.rename("Rp"), factors], axis=1).dropna()
-    return df
+def _prep(rp, ff, cols):
+    r = _squeeze(rp).rename("Rp")
+    avail = [c for c in cols + ["RF"] if c in ff.columns]
+    if "RF" not in avail:
+        raise ValueError("RF column missing from ff_factors")
+    df = pd.concat([r, ff[avail]], axis=1).dropna()
+    if len(df) < 30:
+        raise ValueError(f"Only {len(df)} aligned obs — need 30+")
+    y  = (df["Rp"] - df["RF"]).values.astype(float)
+    fc = [c for c in cols if c in df.columns]
+    X  = df[fc].values.astype(float)
+    return y, X, fc
 
 
-def run_capm(portfolio_returns: pd.Series,
-             factors: pd.DataFrame) -> dict:
-    """
-    OLS regression: excess_return ~ MKT
-    Expects factors to contain 'Mkt-RF' and 'RF'.
-    """
-    df = _align_data(portfolio_returns, factors)
-    df["excess_Rp"] = df["Rp"] - df["RF"]
-    X = sm.add_constant(df["Mkt-RF"])
-    y = df["excess_Rp"]
-    model = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 5})
-    return _extract_results(model, "CAPM")
-
-
-def run_ff3(portfolio_returns: pd.Series,
-            factors: pd.DataFrame) -> dict:
-    """
-    OLS regression: excess_return ~ MKT + SMB + HML
-    """
-    df = _align_data(portfolio_returns, factors)
-    df["excess_Rp"] = df["Rp"] - df["RF"]
-    factor_cols = ["Mkt-RF", "SMB", "HML"]
-    X = sm.add_constant(df[factor_cols])
-    y = df["excess_Rp"]
-    model = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 5})
-    return _extract_results(model, "Fama-French 3")
-
-
-def run_ff5(portfolio_returns: pd.Series,
-            factors: pd.DataFrame) -> dict:
-    """
-    OLS regression: excess_return ~ MKT + SMB + HML + RMW + CMA
-    Requires FF5 factors (RMW, CMA present in factors).
-    """
-    df = _align_data(portfolio_returns, factors)
-    df["excess_Rp"] = df["Rp"] - df["RF"]
-    factor_cols = [c for c in ["Mkt-RF", "SMB", "HML", "RMW", "CMA"]
-                   if c in df.columns]
-    if len(factor_cols) < 5:
-        return {"error": "FF5 factors not all available. Using available ones.",
-                "available": factor_cols}
-    X = sm.add_constant(df[factor_cols])
-    y = df["excess_Rp"]
-    model = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 5})
-    return _extract_results(model, "Fama-French 5")
-
-
-def run_ff5_momentum(portfolio_returns: pd.Series,
-                     factors: pd.DataFrame) -> dict:
-    """
-    OLS regression: excess_return ~ MKT + SMB + HML + RMW + CMA + MOM
-    """
-    df = _align_data(portfolio_returns, factors)
-    df["excess_Rp"] = df["Rp"] - df["RF"]
-    factor_cols = [c for c in ["Mkt-RF", "SMB", "HML", "RMW", "CMA", "Mom"]
-                   if c in df.columns]
-    X = sm.add_constant(df[factor_cols])
-    y = df["excess_Rp"]
-    model = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 5})
-    return _extract_results(model, "FF5 + Momentum")
-
-
-def _extract_results(model: sm.regression.linear_model.RegressionResultsWrapper,
-                     model_name: str) -> dict:
-    """Extract key stats from statsmodels OLS result."""
-    params = model.params
-    tvalues = model.tvalues
-    pvalues = model.pvalues
-    conf_int = model.conf_int()
-
-    # Annualise alpha (intercept)
-    alpha_daily = params.get("const", np.nan)
-    alpha_annual = ((1 + alpha_daily) ** TRADING_DAYS - 1) * 100  # in %
-
-    results = {
-        "model": model_name,
-        "alpha_daily": alpha_daily,
-        "alpha_annual_pct": alpha_annual,
-        "alpha_tstat": tvalues.get("const", np.nan),
-        "alpha_pvalue": pvalues.get("const", np.nan),
-        "alpha_significant": pvalues.get("const", 1.0) < 0.05,
-        "r_squared": model.rsquared,
-        "adj_r_squared": model.rsquared_adj,
-        "n_obs": int(model.nobs),
-        "factors": {},
+def _ols(y, X, fnames, maxlags=5):
+    Xc  = sm.add_constant(X)
+    res = sm.OLS(y, Xc).fit(cov_type="HAC", cov_kwds={"maxlags": maxlags})
+    p   = res.params
+    tv  = res.tvalues
+    pv  = res.pvalues
+    ci  = res.conf_int()
+    ic  = float(p[0])
+    ia  = float((1 + ic) ** 252 - 1) * 100
+    it  = float(tv[0])
+    ip  = float(pv[0])
+    factors = {}
+    for i, fn in enumerate(fnames, 1):
+        if i < len(p):
+            factors[fn] = {
+                "loading":     float(p[i]),
+                "t_stat":      float(tv[i]),
+                "p_value":     float(pv[i]),
+                "ci_low":      float(ci.iloc[i, 0]),
+                "ci_high":     float(ci.iloc[i, 1]),
+                "significant": bool(abs(float(tv[i])) > 2),
+            }
+    return {
+        "alpha_annual_pct":  ia,
+        "alpha_daily":       ic,
+        "alpha_tstat":       it,
+        "alpha_pvalue":      ip,
+        "alpha_significant": bool(abs(it) > 2 and ip < 0.05),
+        "r_squared":         float(res.rsquared),
+        "r_squared_adj":     float(res.rsquared_adj),
+        "n_obs":             int(res.nobs),
+        "factors":           factors,
     }
 
-    for factor in params.index:
-        if factor == "const":
-            continue
-        results["factors"][factor] = {
-            "loading": params[factor],
-            "t_stat": tvalues[factor],
-            "p_value": pvalues[factor],
-            "significant": pvalues[factor] < 0.05,
-            "ci_lower": conf_int.loc[factor, 0],
-            "ci_upper": conf_int.loc[factor, 1],
-        }
 
-    return results
+def run_capm(rp, ff):
+    y, X, fc = _prep(rp, ff, ["Mkt-RF"])
+    return _ols(y, X, fc)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ROLLING BETAS & CORRELATIONS
-# ─────────────────────────────────────────────────────────────────────────────
-def rolling_beta(portfolio_returns: pd.Series,
-                 market_returns: pd.Series,
-                 window: int = 63) -> pd.Series:
-    """Compute rolling beta using a fixed window (default 63 trading days ≈ 1Q)."""
-    df = pd.concat([portfolio_returns, market_returns], axis=1,
-                   keys=["Rp", "Rm"]).dropna()
-    X = sm.add_constant(df["Rm"])
-    rols = RollingOLS(df["Rp"], X, window=window).fit()
-    return rols.params["Rm"].rename("Rolling Beta")
+def run_ff3(rp, ff):
+    y, X, fc = _prep(rp, ff, ["Mkt-RF", "SMB", "HML"])
+    return _ols(y, X, fc)
 
 
-def rolling_correlation(portfolio_returns: pd.Series,
-                         market_returns: pd.Series,
-                         window: int = 63) -> pd.Series:
-    """Rolling Pearson correlation between portfolio and market."""
-    df = pd.concat([portfolio_returns, market_returns], axis=1).dropna()
-    return df.iloc[:, 0].rolling(window).corr(df.iloc[:, 1])
+def run_ff5(rp, ff):
+    y, X, fc = _prep(rp, ff, ["Mkt-RF", "SMB", "HML", "RMW", "CMA"])
+    return _ols(y, X, fc)
 
 
-def rolling_volatility(returns: pd.Series, window: int = 21) -> pd.Series:
-    """Annualised rolling volatility."""
-    return returns.rolling(window).std() * np.sqrt(TRADING_DAYS)
+def run_ff5_momentum(rp, ff):
+    y, X, fc = _prep(rp, ff, ["Mkt-RF", "SMB", "HML", "RMW", "CMA", "Mom"])
+    return _ols(y, X, fc)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# REGIME ANALYSIS
-# ─────────────────────────────────────────────────────────────────────────────
-def regime_analysis(portfolio_returns: pd.Series,
-                    market_returns: pd.Series,
-                    risk_free_rate: pd.Series,
-                    regime_mask: pd.Series,
-                    name: str = "Portfolio") -> dict:
-    """
-    Compare metrics in HIGH vs LOW volatility regimes.
-    regime_mask: boolean Series, True = high vol.
-    """
-    from analysis.risk_metrics import (compute_sharpe, compute_max_drawdown,
-                                        compute_cvar, compute_beta)
+def rolling_alpha(rp, ff, model="FF5", window=252):
+    fn_map   = {"CAPM": run_capm, "FF3": run_ff3, "FF5": run_ff5}
+    fn       = fn_map.get(model, run_ff5)
+    cols_map = {
+        "CAPM": ["Mkt-RF"],
+        "FF3":  ["Mkt-RF", "SMB", "HML"],
+        "FF5":  ["Mkt-RF", "SMB", "HML", "RMW", "CMA"],
+    }
+    cols  = cols_map.get(model, ["Mkt-RF", "SMB", "HML", "RMW", "CMA"])
+    avail = [c for c in cols + ["RF"] if c in ff.columns]
+    r     = _squeeze(rp)
+    df    = pd.concat([r.rename("Rp"), ff[avail]], axis=1).dropna()
+    out   = pd.Series(index=df.index, dtype=float)
+    for i in range(window, len(df) + 1):
+        chunk = df.iloc[i - window:i]
+        try:
+            res = fn(chunk["Rp"], chunk[avail])
+            out.iloc[i - 1] = res.get("alpha_annual_pct", np.nan)
+        except Exception:
+            out.iloc[i - 1] = np.nan
+    return out
 
-    results = {}
-    for label, mask in [("High Volatility", regime_mask),
-                         ("Low Volatility", ~regime_mask)]:
-        p = portfolio_returns[mask]
-        m = market_returns[mask]
-        rf = risk_free_rate[mask]
-        if len(p) < 10:
-            continue
-        results[label] = {
-            "n_days": len(p),
-            "ann_return_pct": p.mean() * TRADING_DAYS * 100,
-            "ann_vol_pct": p.std() * np.sqrt(TRADING_DAYS) * 100,
-            "beta": compute_beta(p, m),
-            "sharpe": compute_sharpe(p, rf),
-            "max_dd_pct": compute_max_drawdown(p) * 100,
-            "cvar_95_pct": compute_cvar(p, 0.95) * 100,
-        }
-    return results
+
+def factor_decomposition(ff_result, ff_factors):
+    rows   = []
+    fmeans = ff_factors.mean()
+    for fn, fd in ff_result.get("factors", {}).items():
+        b      = fd.get("loading", 0)
+        mr     = float(fmeans.get(fn, 0))
+        contrib = b * mr * 252 * 100
+        rows.append({
+            "Factor":                  fn,
+            "Beta":                    round(b, 4),
+            "Mean Factor Ret (% ann)": round(mr * 252 * 100, 3),
+            "Contribution (bps)":      round(contrib * 100, 1),
+            "Significant":             fd.get("significant", False),
+        })
+    return pd.DataFrame(rows)
